@@ -1,0 +1,25 @@
+[project]
+name = "f1-strategy"
+description = "F1 Racing Strategy Training Environment"
+tags = ["single-turn", "strategy", "f1", "racing", "train", "eval"]
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "verifiers>=0.1.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["f1_strategy.py", "pyproject.toml", "data/*", "scripts/*"]
+
+[tool.verifiers.eval]
+num_examples = 10
+rollouts_per_example = 4
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
