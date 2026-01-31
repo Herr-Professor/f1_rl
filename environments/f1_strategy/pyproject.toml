@@ -2,7 +2,7 @@
 name = "f1-strategy"
 description = "F1 Racing Strategy Training Environment"
 tags = ["single-turn", "strategy", "f1", "racing", "train", "eval"]
-version = "0.1.0"
+version = "0.1.13"
 requires-python = ">=3.10"
 dependencies = [
     "verifiers>=0.1.8",
@@ -14,6 +14,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build]
 include = ["f1_strategy.py", "pyproject.toml", "data/*", "scripts/*"]
+
+[tool.hatch.build.targets.wheel]
+py-modules = ["f1_strategy"]
 
 [tool.verifiers.eval]
 num_examples = 10

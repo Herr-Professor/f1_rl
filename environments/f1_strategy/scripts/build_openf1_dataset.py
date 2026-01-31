@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -168,6 +169,21 @@ def _nearest_by_date(rows: Iterable[Dict[str, Any]], target: datetime) -> Option
     return best
 
 
+def _recent_by_date(rows: Iterable[Dict[str, Any]], target: datetime, count: int = 3) -> List[Dict[str, Any]]:
+    dated = []
+    for row in rows:
+        dt = _parse_datetime(row.get("date") or row.get("date_start"))
+        if not dt or dt > target:
+            continue
+        dated.append((dt, row))
+    dated.sort(key=lambda x: x[0])
+    return [row for _, row in dated[-count:]]
+
+
+def _get_lap_row(laps: List[Dict[str, Any]], lap_number: int) -> Optional[Dict[str, Any]]:
+    return next((l for l in laps if int(l.get("lap_number", -1)) == int(lap_number)), None)
+
+
 def _linear_slope(xs: List[float], ys: List[float]) -> float:
     if len(xs) < 2:
         return 0.0
@@ -199,67 +215,6 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
-def _build_prompt(
-    lap_number: int,
-    total_laps: int,
-    position: int,
-    compound: str,
-    tire_age: int,
-    gap_to_leader: float,
-    interval: float,
-    fuel_remaining: int,
-    weather_line: str,
-    pace_delta: float,
-    degradation_slope: float,
-    undercut_window: float,
-    pit_loss_est: float,
-    sc_risk_proxy: float,
-    track: str,
-) -> str:
-    return f"""Race Status - Lap {lap_number}/{total_laps}
-Position: P{position}
-Current Tires: {compound.capitalize()} ({tire_age} laps old)
-Gap to Leader: +{gap_to_leader:.1f}s
-Gap to Car Ahead: +{interval:.1f}s
-Fuel: {fuel_remaining}% remaining
-Weather: {weather_line}
-Pace Delta (last 3 laps vs stint median): {pace_delta:+.2f}s
-Degradation Slope (s/lap): {degradation_slope:+.3f}
-Undercut Window (s): {undercut_window:+.1f}
-Estimated Pit Loss (s): {pit_loss_est:.1f}
-Safety Car Risk (0-1): {sc_risk_proxy:.2f}
-Track: {track}
-
-What is your strategy?
-A) Pit now for soft tires
-B) Pit now for intermediates (prepare for rain)
-C) Stay out on current tires
-D) Pit when rain starts
-
-Reply with your choice and reasoning.
-"""
-
-
-def _label_strategy(
-    laps_to_pit: int,
-    compound: str,
-    tire_age: int,
-    rainfall: float,
-) -> str:
-    if rainfall > 0:
-        if laps_to_pit <= 2:
-            return "B"
-        return "D"
-
-    if laps_to_pit <= 2:
-        return "A"
-    if compound == "hard" and tire_age > 20:
-        return "A"
-    if tire_age < 10:
-        return "C"
-    return "C"
-
-
 def build_dataset(
     years: List[int],
     max_sessions: int,
@@ -285,6 +240,12 @@ def build_dataset(
             _safe_float(p.get("pit_duration")) for p in pits if _safe_float(p.get("pit_duration"))
         ]
         pit_loss_est = _median(pit_durations) if pit_durations else 22.0
+        pits_by_driver: Dict[int, List[Dict[str, Any]]] = {}
+        for p in pits:
+            dn = p.get("driver_number")
+            if dn is None:
+                continue
+            pits_by_driver.setdefault(int(dn), []).append(p)
 
         positions_cache: Dict[int, List[Dict[str, Any]]] = {}
         intervals_cache: Dict[int, List[Dict[str, Any]]] = {}
@@ -328,8 +289,8 @@ def build_dataset(
                 continue
 
             position = position_row.get("position")
-            gap_to_leader = interval_row.get("gap_to_leader")
-            interval = interval_row.get("interval")
+            gap_to_leader = _safe_float(interval_row.get("gap_to_leader"))
+            interval = _safe_float(interval_row.get("interval"))
 
             if position is None or gap_to_leader is None or interval is None:
                 continue
@@ -377,25 +338,109 @@ def build_dataset(
             laps_to_pit = int(lap_end - lap_number)
             fuel_remaining = max(0, min(100, int(round((1 - (lap_number / max(total_laps, 1))) * 100))))
 
-            answer = _label_strategy(laps_to_pit, compound.lower(), tire_age, rainfall)
+            # Recent position trend (proxy for track position delta)
+            past_lap_num = max(int(lap_number) - 5, int(lap_start))
+            past_lap = _get_lap_row(laps, past_lap_num)
+            past_date = _parse_datetime(past_lap.get("date_start") or past_lap.get("date")) if past_lap else None
+            past_pos_row = _nearest_by_date(positions_cache[int(driver_number)], past_date) if past_date else None
+            position_delta_recent = 0
+            if past_pos_row and past_pos_row.get("position") is not None:
+                position_delta_recent = int(past_pos_row["position"]) - int(position)
 
-            prompt_text = _build_prompt(
-                lap_number=lap_number,
-                total_laps=total_laps,
-                position=int(position),
-                compound=compound.lower(),
-                tire_age=tire_age,
-                gap_to_leader=float(gap_to_leader),
-                interval=float(interval),
-                fuel_remaining=fuel_remaining,
-                weather_line=weather_line,
-                pace_delta=pace_delta,
-                degradation_slope=degradation_slope,
-                undercut_window=undercut_window,
-                pit_loss_est=pit_loss_est,
-                sc_risk_proxy=sc_risk_proxy,
-                track=session.circuit,
-            )
+            # Traffic + DRS proxies based on recent intervals
+            recent_intervals = _recent_by_date(intervals_cache[int(driver_number)], lap_date, count=3)
+            recent_interval_values = [
+                _safe_float(r.get("interval")) for r in recent_intervals if _safe_float(r.get("interval")) is not None
+            ]
+            drs_train_proxy = bool(recent_interval_values) and all(v < 1.0 for v in recent_interval_values)
+            traffic_tightness = float(interval) if interval is not None else 99.0
+
+            # Warmup risk proxy
+            warmup_risk = 1.0 if (track_temp is not None and track_temp < 25.0 and lap_number <= 10) else 0.0
+
+            # Outcome-based label: compare near-future position/gap
+            future_lap_num = min(int(lap_number) + 5, int(lap_end))
+            future_lap = _get_lap_row(laps, future_lap_num)
+            future_date = _parse_datetime(future_lap.get("date_start") or future_lap.get("date")) if future_lap else None
+            future_pos_row = _nearest_by_date(positions_cache[int(driver_number)], future_date) if future_date else None
+            future_int_row = _nearest_by_date(intervals_cache[int(driver_number)], future_date) if future_date else None
+            delta_gap = 0.0
+            delta_position = 0.0
+            if future_pos_row and future_pos_row.get("position") is not None:
+                delta_position = float(int(position) - int(future_pos_row["position"]))
+            if future_int_row and future_int_row.get("gap_to_leader") is not None:
+                delta_gap = float(future_int_row["gap_to_leader"]) - float(gap_to_leader)
+            outcome_score = (-delta_gap) + (2.0 * delta_position)
+
+            # Pit timing + rain timing
+            driver_pits = pits_by_driver.get(int(driver_number), [])
+            pit_laps = [
+                int(p.get("lap_number"))
+                for p in driver_pits
+                if p.get("lap_number") is not None and int(p.get("lap_number")) >= int(lap_number)
+            ]
+            next_pit_lap = min(pit_laps) if pit_laps else None
+            pit_now = next_pit_lap is not None and next_pit_lap <= int(lap_number) + 2
+
+            lookahead_seconds = max(60.0, lap_duration * 3)
+            rain_soon = False
+            if weather_rows and lap_date:
+                end_time = lap_date + timedelta(seconds=lookahead_seconds)
+                for row in weather_rows:
+                    dt = _parse_datetime(row.get("date"))
+                    if not dt or dt < lap_date or dt > end_time:
+                        continue
+                    if float(row.get("rainfall", 0.0)) > 0:
+                        rain_soon = True
+                        break
+
+            # Improved answer labeling with more nuanced strategy logic
+            # and synthetic rain injection for B/D answer balance
+            
+            # Synthetic rain injection: ~15% chance for dry sessions to add rain scenarios
+            synthetic_rain = False
+            if rainfall == 0.0 and not rain_soon and random.random() < 0.15:
+                synthetic_rain = True
+                rain_soon = True
+                rainfall = 0.0  # Keep current rainfall at 0, but rain_soon = True
+            
+            if rain_soon or rainfall > 0:
+                # Rain scenario: B = pit now for inters, D = wait for rain
+                if pit_now or (tire_age > 15 and rainfall > 0.3):
+                    answer = "B"  # Pit now for intermediates
+                else:
+                    answer = "D"  # Wait and pit when rain starts
+            elif degradation_slope > 0.08 or (tire_age > 25 and pace_delta > 0.5):
+                # High degradation or old worn tires: pit for fresh rubber
+                answer = "A"
+            elif undercut_window < pit_loss_est * 0.85 and traffic_tightness < 1.5 and position > 5:
+                # Good undercut opportunity with car ahead
+                answer = "A"
+            elif outcome_score < -5.0 and tire_age > 15:
+                # Poor outcome expected, aggressive strategy may help
+                answer = "A"
+            elif pit_now:
+                # Scheduled pit: decide based on outcome
+                answer = "A" if outcome_score >= 0 else "C"
+            elif outcome_score > 3.0 or (pace_delta < -0.3 and tire_age < 15):
+                # Good pace or positive outlook: stay out
+                answer = "C"
+            elif tire_age < 10 and pace_delta < 0:
+                # Fresh tires with good pace: extend stint
+                answer = "D"
+            else:
+                # Default: stay out if holding position, otherwise consider alternatives
+                answer = "C" if position_delta_recent >= 0 else "A"
+
+            # Signal conflict score: multiple contradictory indicators
+            conflict_score = 0
+            if degradation_slope > 0.07 and undercut_window < 0:
+                conflict_score += 1
+            if pace_delta < -0.5 and interval > 1.5:
+                conflict_score += 1
+            if position_delta_recent > 0 and pace_delta > 0.5:
+                conflict_score += 1
+            prompt_text = f"OpenF1 scenario: Lap {lap_number} at {session.circuit}."
 
             scenarios.append(
                 {
@@ -440,6 +485,15 @@ def build_dataset(
                             "air_temp": air_temp,
                             "humidity": humidity,
                             "wind_speed": wind_speed,
+                            "traffic_tightness": traffic_tightness,
+                            "drs_train_proxy": drs_train_proxy,
+                            "position_delta_recent": position_delta_recent,
+                            "warmup_risk": warmup_risk,
+                            "outcome_score": float(outcome_score),
+                            "rain_soon": rain_soon,
+                            "pit_now": pit_now,
+                            "conflict_score": conflict_score,
+                            "synthetic_rain": synthetic_rain,
                         }
                     ),
                 }

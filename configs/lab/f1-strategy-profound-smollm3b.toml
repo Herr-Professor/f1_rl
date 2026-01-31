@@ -1,4 +1,4 @@
-model = "Qwen/Qwen3-4B-Instruct-2507"
+model = "HuggingFaceTB/SmolLM3-3B"
 max_steps = 200
 batch_size = 256
 rollouts_per_example = 8

@@ -4,7 +4,7 @@ batch_size = 128
 rollouts_per_example = 8
 
 [sampling]
-max_tokens = 700
+max_tokens = 900
 
 [[env]]
 id = "herr-professor/f1-strategy"

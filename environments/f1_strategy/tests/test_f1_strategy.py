@@ -33,7 +33,7 @@ def test_multi_env_loads():
     """Test multi-environment mode creates EnvGroup."""
     from f1_strategy import load_environment
     env = load_environment(multi_env=True, max_tracks=2, eval_season=None)
-    assert type(env).__name__ == "EnvGroup"
+    assert type(env).__name__ in ("EnvGroup", "F1EnvGroup")
     assert len(env.envs) <= 2
 
 

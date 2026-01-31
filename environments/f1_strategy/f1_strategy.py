@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -44,12 +45,14 @@ def _parse_info(info) -> Dict[str, Any]:
 
 def _system_prompt(use_tools: bool, multi_turn: bool) -> str:
     tool_line = (
-        "You may use tools for tire degradation, pit delta, or weather confidence."
+        "You may use tools for tire degradation, pit delta, or weather confidence. "
+        "Your first assistant message must be a tool call. "
+        "After tools, provide a final line in the format: Final: <A/B/C/D>."
         if use_tools
         else "Use the provided signals; do not invent data."
     )
     follow_up = (
-        "The pit wall may ask one follow-up question. Answer it concisely and restate your decision."
+        "The pit wall may ask one follow-up question. Answer it concisely and restate your decision with a Final line."
         if multi_turn
         else "State your decision clearly as a single letter (A/B/C/D) with reasoning."
     )
@@ -66,22 +69,68 @@ def _format_signal(value, suffix: str = "") -> str:
     return f"{value}{suffix}"
 
 
+def _format_bool(value: Optional[bool]) -> str:
+    if value is None:
+        return "Unknown"
+    return "Yes" if value else "No"
+
+
+def _extract_final_choice(text: str) -> Optional[str]:
+    if not text:
+        return None
+    tail_lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    tail = "\n".join(tail_lines[-3:]) if tail_lines else text
+    match = re.search(r"(?:^|\n)\s*(?:final|decision|answer|choice)\s*[:\\-]\\s*([ABCD])\\b", tail, re.I)
+    if match:
+        return match.group(1).upper()
+    match = re.search(r"(?:^|\n)\s*([ABCD])\s*(?:$|[).])", tail)
+    if match:
+        return match.group(1).upper()
+    return None
+
+
+def _get_pit_compound_option(current_compound: str, has_rain: bool) -> Tuple[str, str]:
+    """Return (option_a_compound, option_b_compound) based on current tires and weather."""
+    current = current_compound.lower() if current_compound else "medium"
+    if has_rain:
+        return ("intermediates", "wet")
+    # Offer a different compound than what we're on
+    if current == "soft":
+        return ("medium", "hard")
+    elif current == "hard":
+        return ("soft", "medium")
+    else:  # medium
+        return ("soft", "hard")
+
+
 def _build_prompt_text(info: Dict[str, Any], use_tools: bool, multi_turn: bool) -> str:
     track = info.get("track", "Unknown")
     profile = _track_profile(track)
-    weather_summary = "Rain at circuit" if info.get("rainfall", 0.0) > 0 else "Clear, no changes expected"
+    rainfall = info.get("rainfall", 0.0) or 0.0
+    rain_soon = info.get("rain_soon", False)
+    has_rain = rainfall > 0 or rain_soon
+    weather_summary = "Rain at circuit" if rainfall > 0 else ("Rain expected soon" if rain_soon else "Clear, no changes expected")
+    current_compound = str(info.get("tire_compound", "medium"))
+    
+    # Dynamic tire options based on current compound and weather
+    pit_option_a, pit_option_b = _get_pit_compound_option(current_compound, has_rain)
 
     signals = [
-        f"Pace Delta: {_format_signal(info.get('pace_delta'), 's')} (last 3 laps vs stint median)",
-        f"Degradation Slope: {_format_signal(info.get('degradation_slope'), ' s/lap')}",
-        f"Undercut Window: {_format_signal(info.get('undercut_window'), 's')}",
-        f"Estimated Pit Loss: {_format_signal(info.get('pit_loss_est') or profile['pit_loss'], 's')}",
-        f"Safety Car Risk: {_format_signal(info.get('sc_risk_proxy'), '')} (base {profile['sc_risk_base']})",
+        f"PaceΔ: {_format_signal(info.get('pace_delta'), 's')} (last 3 vs stint median)",
+        f"Deg Slope: {_format_signal(info.get('degradation_slope'), ' s/lap')}",
+        f"Undercut: {_format_signal(info.get('undercut_window'), 's')}",
+        f"Pit Loss: {_format_signal(info.get('pit_loss_est') or profile['pit_loss'], 's')}",
+        f"SC Risk: {_format_signal(info.get('sc_risk_proxy'), '')} (base {profile['sc_risk_base']})",
+        f"Traffic: {_format_signal(info.get('traffic_tightness'), 's')} (gap ahead)",
+        f"DRS Train: {_format_bool(info.get('drs_train_proxy'))}",
+        f"PosΔ(5): {_format_signal(info.get('position_delta_recent'), '')}",
+        f"Warmup: {_format_signal(info.get('warmup_risk'), '')}",
+        f"Conflicts: {_format_signal(info.get('conflict_score'), '')}",
     ]
 
     context = f"""Race Status - Lap {info.get('lap', '?')}/{info.get('total_laps', '?')}
 Position: P{info.get('position', '?')}
-Current Tires: {str(info.get('tire_compound', 'medium')).capitalize()} ({info.get('tire_age', '?')} laps old)
+Current Tires: {current_compound.capitalize()} ({info.get('tire_age', '?')} laps old)
 Gap to Leader: +{info.get('gap_to_leader', '?')}s
 Gap to Car Ahead: +{info.get('interval', '?')}s
 Fuel: {info.get('fuel_remaining', '?')}% remaining
@@ -95,13 +144,25 @@ Track: {track}
         f"baseline SC risk {profile['sc_risk_base']}"
     )
 
-    decision = """
+    # Dynamic options based on tire and weather state
+    if has_rain:
+        decision = f"""
 
 What is your strategy?
-A) Pit now for soft tires
-B) Pit now for intermediates (prepare for rain)
-C) Stay out on current tires
-D) Pit when rain starts
+A) Pit now for {pit_option_a} (rain-ready)
+B) Pit now for {pit_option_b} (full wet)
+C) Stay out on current {current_compound} tires
+D) Pit when rain intensifies
+
+Reply with your choice and reasoning."""
+    else:
+        decision = f"""
+
+What is your strategy?
+A) Pit now for {pit_option_a} tires
+B) Pit now for {pit_option_b} tires
+C) Stay out on current {current_compound} tires
+D) Extend stint and pit later
 
 Reply with your choice and reasoning."""
 
@@ -123,8 +184,13 @@ def _prepare_dataset(dataset: Dataset, use_tools: bool, multi_turn: bool) -> Dat
         info = _parse_info(row.get("info"))
         info.setdefault("track", row.get("track"))
         info.setdefault("season", row.get("season"))
+        info.setdefault("traffic_tightness", row.get("traffic_tightness"))
+        info.setdefault("drs_train_proxy", row.get("drs_train_proxy"))
+        info.setdefault("position_delta_recent", row.get("position_delta_recent"))
+        info.setdefault("warmup_risk", row.get("warmup_risk"))
+        info.setdefault("conflict_score", row.get("conflict_score"))
         row["info"] = json.dumps(info)
-        row["track"] = info.get("track")
+        row["track"] = info.get("track") or "Unknown"
         row["season"] = info.get("season")
         row["prompt"] = _build_prompt_messages(info, use_tools, multi_turn)
         row["example_id"] = int(idx)
@@ -220,7 +286,8 @@ class F1ToolEnv(vf.StatefulToolEnv):
         self.add_tool(self.pit_delta_lookup, args_to_skip=["info"])
         self.add_tool(self.weather_confidence, args_to_skip=["info"])
 
-    def update_tool_args(self, tool_name, tool_args, state):
+    def update_tool_args(self, tool_name, tool_args, messages, state, **kwargs):
+        state["tool_call_count"] = int(state.get("tool_call_count") or 0) + 1
         tool_args["info"] = state.get("info")
         return tool_args
 
@@ -257,15 +324,96 @@ class F1ToolEnv(vf.StatefulToolEnv):
         return "Weather: DRY - no precipitation expected."
 
 
+class F1EnvGroupRubric(vf.Rubric):
+    """Rubric that routes scoring by track info, not task."""
+
+    def __init__(self, env_map: Dict[str, vf.Environment], env_names: List[str]):
+        super().__init__()
+        self.env_map = env_map
+        self.env_names = env_names
+
+        all_names = set()
+        for env in env_map.values():
+            all_names.update(env.rubric._get_reward_func_names())
+        self.all_reward_names = sorted(all_names)
+
+    def _resolve_env(self, state: vf.State) -> Optional[vf.Environment]:
+        info = _parse_info(state.get("info"))
+        track = info.get("track")
+        if track in self.env_map:
+            return self.env_map[track]
+        task = state.get("task")
+        if task in self.env_map:
+            return self.env_map[task]
+        if self.env_names:
+            return self.env_map.get(self.env_names[0])
+        return None
+
+    def _empty_metrics(self) -> Dict[str, float]:
+        return {name: 0.0 for name in self.all_reward_names}
+
+    async def score_rollout(self, state: vf.State, score_sem) -> None:
+        env = self._resolve_env(state)
+        if env is None:
+            state["reward"] = 0.0
+            state["metrics"] = self._empty_metrics()
+            return
+        await env.rubric.score_rollout(state, score_sem=score_sem)
+        metrics = self._empty_metrics()
+        for name, value in (state.get("metrics") or {}).items():
+            if name in metrics:
+                metrics[name] = value
+        state["metrics"] = metrics
+
+    async def score_group(self, states: List[vf.State], score_sem) -> None:
+        if not states:
+            return
+        env = self._resolve_env(states[0])
+        if env is None:
+            for state in states:
+                state["reward"] = 0.0
+                state["metrics"] = self._empty_metrics()
+                state["timing"]["scoring_ms"] = 0.0
+            return
+        await env.rubric.score_group(states, score_sem=score_sem)
+        for state in states:
+            metrics = self._empty_metrics()
+            for name, value in (state.get("metrics") or {}).items():
+                if name in metrics:
+                    metrics[name] = value
+            state["metrics"] = metrics
+
+
+class F1EnvGroup(vf.EnvGroup):
+    """EnvGroup that routes by track while keeping task stable for Prime-RL."""
+
+    def __init__(self, env_id: str, **kwargs):
+        super().__init__(env_id=env_id, **kwargs)
+        self.env_id = env_id
+        self.rubric = F1EnvGroupRubric(self.env_map, self.env_names)
+        if self.dataset is not None:
+            self.dataset = self.dataset.map(lambda row: {**row, "task": env_id})
+        if self.eval_dataset is not None:
+            self.eval_dataset = self.eval_dataset.map(lambda row: {**row, "task": env_id})
+
+    async def rollout(self, input, client, model, sampling_args=None):
+        info = _parse_info(input.get("info"))
+        track = info.get("track")
+        env = self.env_map.get(track) if track in self.env_map else None
+        if env is None:
+            env = self.envs[0]
+        routed = dict(input)
+        routed["task"] = self.env_id
+        return await env.rollout(routed, client, model, sampling_args)
+
+
 async def correct_strategy(completion, answer) -> float:
     """Reward for choosing the correct strategy."""
-    import re
     if not completion:
         return 0.0
-    response = completion[-1]["content"].upper()
-    # Match patterns like "A)", "A.", "A:", "A ", standalone "A" at start, or "OPTION A"
-    pattern = rf"(?:^|\s|OPTION\s*){answer}(?:[).:,\s]|$)"
-    return 1.0 if re.search(pattern, response) else 0.0
+    response = completion[-1]["content"]
+    choice = _extract_final_choice(response)
+    return 1.0 if choice == str(answer).upper() else 0.0
 
 
 async def has_reasoning(completion) -> float:
@@ -296,8 +444,12 @@ async def mentions_key_factors(completion, info) -> float:
         score += 0.05
     if info_dict.get("sc_risk_proxy") is not None and ("safety car" in response or "vsc" in response):
         score += 0.05
+    if "traffic" in response or "drs" in response:
+        score += 0.05
+    if "warmup" in response or "warm-up" in response:
+        score += 0.05
 
-    return min(score, 0.3)
+    return min(score, 0.35)
 
 
 async def acknowledges_uncertainty(completion) -> float:
@@ -309,6 +461,36 @@ async def acknowledges_uncertainty(completion) -> float:
     return 0.1 if any(k in response for k in keywords) else 0.0
 
 
+async def outcome_aligned(completion, answer, info) -> float:
+    """Reward for alignment with actual race outcome."""
+    if not completion:
+        return 0.0
+    info_dict = _parse_info(info)
+    outcome_score = info_dict.get("outcome_score", 0.0)
+    response = completion[-1]["content"]
+    choice = _extract_final_choice(response)
+    if choice == str(answer).upper():
+        # Bonus if the outcome was positive (position gained or gap closed)
+        return 0.15 if outcome_score > 0 else 0.05
+    return 0.0
+
+
+async def uses_tools(completion, tool_call_count: Optional[int] = None, use_tools: bool = False) -> float:
+    """Reward for invoking at least one tool call. Only penalize when tools are enabled."""
+    if tool_call_count and tool_call_count > 0:
+        return 0.1
+    # Only penalize missing tool calls when tools are explicitly enabled
+    return -0.2 if use_tools else 0.0
+
+
+async def final_choice_present(completion) -> float:
+    """Penalty if a final choice is missing."""
+    if not completion:
+        return -0.3
+    response = completion[-1]["content"]
+    return 0.0 if _extract_final_choice(response) else -0.3
+
+
 def load_environment(
     num_examples: int = -1,
     eval_season: Optional[int] = 2024,
@@ -318,25 +500,42 @@ def load_environment(
     multi_env: bool = False,
     env_tracks: Optional[List[str]] = None,
     max_tracks: int = 4,
-    max_tokens: int = 512,
+    max_tokens: int = 900,
+    env_id: str = "herr-professor/f1-strategy",
 ) -> vf.Environment:
     """Load the F1 strategy environment."""
     dataset = create_f1_dataset(use_tools=use_tools, multi_turn=multi_turn)
     train_dataset, eval_dataset = _split_train_eval(dataset, eval_season, eval_tracks)
+    if train_dataset is None or len(train_dataset) == 0:
+        train_dataset = dataset
+    if eval_dataset is not None and len(eval_dataset) == 0:
+        eval_dataset = None
 
     if num_examples > 0:
         train_dataset = train_dataset.select(range(min(num_examples, len(train_dataset))))
         if eval_dataset is not None:
             eval_dataset = eval_dataset.select(range(min(num_examples, len(eval_dataset))))
 
-    def build_rubric() -> vf.Rubric:
+    def build_rubric(tools_enabled: bool = False) -> vf.Rubric:
+        # Create closure to pass use_tools flag to uses_tools function
+        async def uses_tools_wrapper(completion, tool_call_count: Optional[int] = None) -> float:
+            return await uses_tools(completion, tool_call_count, use_tools=tools_enabled)
+        
         return vf.Rubric(
-            funcs=[correct_strategy, has_reasoning, mentions_key_factors, acknowledges_uncertainty],
-            weights=[1.0, 0.2, 0.3, 0.1],
+            funcs=[
+                correct_strategy,
+                has_reasoning,
+                mentions_key_factors,
+                acknowledges_uncertainty,
+                outcome_aligned,
+                uses_tools_wrapper,
+                final_choice_present,
+            ],
+            weights=[1.0, 0.2, 0.35, 0.1, 0.15, 0.1, 1.0],
         )
 
     def build_env(ds: Dataset, eval_ds: Optional[Dataset]) -> vf.Environment:
-        rubric = build_rubric()
+        rubric = build_rubric(tools_enabled=use_tools)
         if use_tools:
             return F1ToolEnv(dataset=ds, eval_dataset=eval_ds, rubric=rubric, max_tokens=max_tokens, max_turns=6)
         if multi_turn:
@@ -358,6 +557,7 @@ def load_environment(
 
     envs = []
     env_names = []
+
     for track in tracks:
         track_ds = train_dataset.filter(lambda row: row.get("track") == track)
         track_eval = None
@@ -370,4 +570,4 @@ def load_environment(
         envs.append(build_env(track_ds, track_eval))
         env_names.append(track)
 
-    return vf.EnvGroup(envs=envs, env_names=env_names)
+    return F1EnvGroup(envs=envs, env_names=env_names, env_id=env_id)
