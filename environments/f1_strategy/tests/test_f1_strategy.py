@@ -7,7 +7,7 @@ import pytest
 def test_environment_loads():
     """Test that the environment loads without errors."""
     from f1_strategy import load_environment
-    env = load_environment(eval_season=None)  # No eval split, only 2023 data
+    env = load_environment(eval_season=None, deep_reasoning=True)  # No eval split, only 2023 data
     assert env is not None
     assert len(env.dataset) > 0
 
@@ -15,14 +15,14 @@ def test_environment_loads():
 def test_multi_turn_env_loads():
     """Test multi-turn pit wall environment."""
     from f1_strategy import load_environment
-    env = load_environment(multi_turn=True, eval_season=None)
+    env = load_environment(multi_turn=True, eval_season=None, deep_reasoning=True)
     assert type(env).__name__ == "F1PitWallEnv"
 
 
 def test_tool_env_loads():
     """Test tool environment with all three tools."""
     from f1_strategy import load_environment
-    env = load_environment(use_tools=True, eval_season=None)
+    env = load_environment(use_tools=True, eval_season=None, deep_reasoning=True)
     assert type(env).__name__ == "F1ToolEnv"
     assert hasattr(env, "tire_deg_estimator")
     assert hasattr(env, "pit_delta_lookup")
@@ -32,7 +32,7 @@ def test_tool_env_loads():
 def test_multi_env_loads():
     """Test multi-environment mode creates EnvGroup."""
     from f1_strategy import load_environment
-    env = load_environment(multi_env=True, max_tracks=2, eval_season=None)
+    env = load_environment(multi_env=True, max_tracks=2, eval_season=None, deep_reasoning=True)
     assert type(env).__name__ in ("EnvGroup", "F1EnvGroup")
     assert len(env.envs) <= 2
 
@@ -77,6 +77,25 @@ def test_track_priors():
     # Unknown track should get default
     default = _track_profile("UnknownTrack")
     assert default["pit_loss"] == 22.0
+
+
+def test_deep_reasoning_prompt_includes_model_block():
+    """Ensure deep reasoning prompts include the strategy model block."""
+    from f1_strategy import _build_prompt_text
+    info = {
+        "track": "Monaco",
+        "tire_compound": "medium",
+        "lap_duration": 95.0,
+        "degradation_slope": 0.05,
+        "undercut_window": 20.0,
+        "pit_loss_est": 22.0,
+        "traffic_tightness": 1.0,
+        "sc_risk_proxy": 0.3,
+        "rainfall": 0.0,
+        "rain_soon": False,
+    }
+    prompt = _build_prompt_text(info, use_tools=False, multi_turn=False, deep_reasoning=True)
+    assert "Strategy Model" in prompt
 
 
 if __name__ == "__main__":

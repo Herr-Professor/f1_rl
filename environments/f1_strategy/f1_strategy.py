@@ -27,9 +27,33 @@ TRACK_PRIORS: Dict[str, Dict[str, float]] = {
 
 DEFAULT_TRACK_PROFILE = {"pit_loss": 22.0, "overtake_difficulty": 0.60, "sc_risk_base": 0.30}
 
+COMPOUND_PARAMS: Dict[str, Dict[str, float]] = {
+    # pace_offset in seconds (negative = faster), deg_factor multiplies slope
+    # dry_penalty and wet_penalty are expected per-lap penalties based on rain probability
+    "soft": {"pace_offset": -0.25, "deg_factor": 1.15, "dry_penalty": 0.0, "wet_penalty": 2.0},
+    "medium": {"pace_offset": 0.00, "deg_factor": 1.00, "dry_penalty": 0.0, "wet_penalty": 2.0},
+    "hard": {"pace_offset": 0.20, "deg_factor": 0.85, "dry_penalty": 0.0, "wet_penalty": 2.0},
+    "intermediates": {"pace_offset": 0.80, "deg_factor": 1.05, "dry_penalty": 0.9, "wet_penalty": 0.3},
+    "wet": {"pace_offset": 1.40, "deg_factor": 1.10, "dry_penalty": 1.6, "wet_penalty": 0.1},
+}
+
+DEFAULT_COMPOUND_PARAMS = {"pace_offset": 0.10, "deg_factor": 1.00, "dry_penalty": 0.0, "wet_penalty": 2.0}
+
+STRATEGY_MODEL_DEFAULTS = {
+    "horizon_laps": 6,
+    "delay_laps": 3,
+    "fresh_deg_factor": 0.60,
+}
+
 
 def _track_profile(track: str) -> Dict[str, float]:
     return TRACK_PRIORS.get(track, DEFAULT_TRACK_PROFILE)
+
+
+def _compound_profile(compound: str) -> Dict[str, float]:
+    if not compound:
+        return DEFAULT_COMPOUND_PARAMS
+    return COMPOUND_PARAMS.get(compound.lower(), DEFAULT_COMPOUND_PARAMS)
 
 
 def _parse_info(info) -> Dict[str, Any]:
@@ -103,7 +127,155 @@ def _get_pit_compound_option(current_compound: str, has_rain: bool) -> Tuple[str
         return ("soft", "hard")
 
 
-def _build_prompt_text(info: Dict[str, Any], use_tools: bool, multi_turn: bool) -> str:
+def _rain_probability(rainfall: float, rain_soon: bool) -> float:
+    if rainfall >= 0.5:
+        return 0.9
+    if rainfall > 0.1:
+        return 0.6
+    if rain_soon:
+        return 0.4
+    return 0.1
+
+
+def _compound_effects(compound: str, rain_prob: float) -> Dict[str, float]:
+    profile = _compound_profile(compound)
+    rain_penalty = profile["dry_penalty"] * (1 - rain_prob) + profile["wet_penalty"] * rain_prob
+    return {
+        "pace_offset": profile["pace_offset"],
+        "deg_factor": profile["deg_factor"],
+        "rain_penalty": rain_penalty,
+    }
+
+
+def _strategy_model_params(info: Dict[str, Any]) -> Dict[str, Any]:
+    track = info.get("track", "Unknown")
+    profile = _track_profile(track)
+    rainfall = float(info.get("rainfall", 0.0) or 0.0)
+    rain_soon = bool(info.get("rain_soon", False))
+    rain_prob = _rain_probability(rainfall, rain_soon)
+    current_compound = str(info.get("tire_compound", "medium")).lower()
+    has_rain = rainfall > 0 or rain_soon
+    pit_option_a, pit_option_b = _get_pit_compound_option(current_compound, has_rain)
+
+    pit_loss = float(info.get("pit_loss_est") or profile["pit_loss"])
+    sc_risk = info.get("sc_risk_proxy")
+    sc_risk = float(sc_risk) if sc_risk is not None else profile["sc_risk_base"]
+    pit_loss_now = pit_loss * (1.0 + 0.6 * sc_risk)
+    pit_loss_later = max(pit_loss * 0.5, pit_loss * (1.0 - 0.6 * sc_risk))
+
+    base_lap = float(info.get("lap_duration") or 90.0)
+    undercut_window = info.get("undercut_window")
+    if undercut_window is not None:
+        fresh_gain = max(0.0, min(1.2, pit_loss - float(undercut_window)))
+    else:
+        fresh_gain = 0.6
+    base_lap_new = max(0.0, base_lap - fresh_gain)
+
+    deg_slope = float(info.get("degradation_slope") or 0.05)
+    deg_slope_new = deg_slope * STRATEGY_MODEL_DEFAULTS["fresh_deg_factor"]
+
+    traffic_gap = info.get("traffic_tightness")
+    traffic_gap = float(traffic_gap) if traffic_gap is not None else 99.0
+    overtake_diff = profile["overtake_difficulty"]
+    traffic_penalty_now = max(0.0, 1.5 - traffic_gap) * (1.0 + 1.5 * overtake_diff)
+    traffic_penalty_later = traffic_penalty_now * 0.5
+
+    horizon_laps = STRATEGY_MODEL_DEFAULTS["horizon_laps"]
+    delay_laps = STRATEGY_MODEL_DEFAULTS["delay_laps"]
+
+    return {
+        "track": track,
+        "current_compound": current_compound,
+        "pit_option_a": pit_option_a,
+        "pit_option_b": pit_option_b,
+        "has_rain": has_rain,
+        "rain_prob": rain_prob,
+        "pit_loss_now": pit_loss_now,
+        "pit_loss_later": pit_loss_later,
+        "traffic_penalty_now": traffic_penalty_now,
+        "traffic_penalty_later": traffic_penalty_later,
+        "base_lap": base_lap,
+        "base_lap_new": base_lap_new,
+        "deg_slope": deg_slope,
+        "deg_slope_new": deg_slope_new,
+        "horizon_laps": horizon_laps,
+        "delay_laps": delay_laps,
+        "compound_effects": {
+            "current": _compound_effects(current_compound, rain_prob),
+            "option_a": _compound_effects(pit_option_a, rain_prob),
+            "option_b": _compound_effects(pit_option_b, rain_prob),
+        },
+    }
+
+
+def _expected_stint_time(
+    base_lap: float,
+    deg_slope: float,
+    compound: str,
+    rain_prob: float,
+    laps: int,
+) -> float:
+    if laps <= 0:
+        return 0.0
+    effects = _compound_effects(compound, rain_prob)
+    per_lap_base = base_lap + effects["pace_offset"] + effects["rain_penalty"]
+    deg_term = deg_slope * effects["deg_factor"]
+    return per_lap_base * laps + deg_term * (laps * (laps + 1) / 2.0)
+
+
+def _expected_option_times(info: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    params = _strategy_model_params(info)
+    horizon = params["horizon_laps"]
+    delay = min(params["delay_laps"], horizon)
+
+    rain_prob = params["rain_prob"]
+    base_lap = params["base_lap"]
+    base_lap_new = params["base_lap_new"]
+    deg_slope = params["deg_slope"]
+    deg_slope_new = params["deg_slope_new"]
+
+    current = params["current_compound"]
+    opt_a = params["pit_option_a"]
+    opt_b = params["pit_option_b"]
+
+    pit_loss_now = params["pit_loss_now"]
+    pit_loss_later = params["pit_loss_later"]
+    traffic_now = params["traffic_penalty_now"]
+    traffic_later = params["traffic_penalty_later"]
+
+    time_a = pit_loss_now + traffic_now + _expected_stint_time(
+        base_lap_new, deg_slope_new, opt_a, rain_prob, horizon
+    )
+    time_b = pit_loss_now + traffic_now + _expected_stint_time(
+        base_lap_new, deg_slope_new, opt_b, rain_prob, horizon
+    )
+    time_c = _expected_stint_time(base_lap, deg_slope, current, rain_prob, horizon)
+
+    time_d = (
+        _expected_stint_time(base_lap, deg_slope, current, rain_prob, delay)
+        + pit_loss_later
+        + traffic_later
+        + _expected_stint_time(base_lap_new, deg_slope_new, opt_a, rain_prob, horizon - delay)
+    )
+
+    return {"A": time_a, "B": time_b, "C": time_c, "D": time_d}, params
+
+
+def _extract_option_times(text: str) -> Dict[str, float]:
+    if not text:
+        return {}
+    pattern = re.compile(r"\b([ABCD])\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+    matches = pattern.findall(text)
+    results: Dict[str, float] = {}
+    for key, value in matches:
+        try:
+            results[key.upper()] = float(value)
+        except ValueError:
+            continue
+    return results
+
+
+def _build_prompt_text(info: Dict[str, Any], use_tools: bool, multi_turn: bool, deep_reasoning: bool) -> str:
     track = info.get("track", "Unknown")
     profile = _track_profile(track)
     rainfall = info.get("rainfall", 0.0) or 0.0
@@ -111,9 +283,10 @@ def _build_prompt_text(info: Dict[str, Any], use_tools: bool, multi_turn: bool) 
     has_rain = rainfall > 0 or rain_soon
     weather_summary = "Rain at circuit" if rainfall > 0 else ("Rain expected soon" if rain_soon else "Clear, no changes expected")
     current_compound = str(info.get("tire_compound", "medium"))
-    
-    # Dynamic tire options based on current compound and weather
-    pit_option_a, pit_option_b = _get_pit_compound_option(current_compound, has_rain)
+
+    strategy_params = _strategy_model_params(info)
+    pit_option_a = strategy_params["pit_option_a"]
+    pit_option_b = strategy_params["pit_option_b"]
 
     signals = [
         f"PaceΔ: {_format_signal(info.get('pace_delta'), 's')} (last 3 vs stint median)",
@@ -144,9 +317,65 @@ Track: {track}
         f"baseline SC risk {profile['sc_risk_base']}"
     )
 
+    strategy_block = ""
+    if deep_reasoning:
+        effects = strategy_params["compound_effects"]
+        strategy_block = f"""
+
+Strategy Model (compute expected total time over the next {strategy_params['horizon_laps']} laps)
+- Horizon: {strategy_params['horizon_laps']} laps
+- Option D delays {strategy_params['delay_laps']} laps, then pits to Option A compound
+- Base lap (current tires): {strategy_params['base_lap']:.3f}s
+- Base lap (fresh tires): {strategy_params['base_lap_new']:.3f}s
+- Degradation slope (current): {strategy_params['deg_slope']:.4f} s/lap
+- Degradation slope (fresh): {strategy_params['deg_slope_new']:.4f} s/lap
+- Pit loss now: {strategy_params['pit_loss_now']:.1f}s; pit loss later: {strategy_params['pit_loss_later']:.1f}s
+- Traffic penalty now: {strategy_params['traffic_penalty_now']:.2f}s; later: {strategy_params['traffic_penalty_later']:.2f}s
+- Rain probability: {strategy_params['rain_prob']:.2f}
+Compound effects (pace_offset, deg_factor, rain_penalty):
+- Current ({current_compound}): {effects['current']['pace_offset']:+.2f}, {effects['current']['deg_factor']:.2f}, {effects['current']['rain_penalty']:.2f}
+- Option A ({pit_option_a}): {effects['option_a']['pace_offset']:+.2f}, {effects['option_a']['deg_factor']:.2f}, {effects['option_a']['rain_penalty']:.2f}
+- Option B ({pit_option_b}): {effects['option_b']['pace_offset']:+.2f}, {effects['option_b']['deg_factor']:.2f}, {effects['option_b']['rain_penalty']:.2f}
+Formula: total(L, compound) = sum_(i=1..L)[base + pace_offset + rain_penalty + deg_slope*deg_factor*i]
+Use base/deg_slope for current tires; use base_lap_new/deg_slope_new after a pit."""
+
     # Dynamic options based on tire and weather state
-    if has_rain:
-        decision = f"""
+    if deep_reasoning:
+        if has_rain:
+            decision = f"""
+
+What is your strategy?
+A) Pit now for {pit_option_a} (rain-ready)
+B) Pit now for {pit_option_b} (full wet)
+C) Stay out on current {current_compound} tires
+D) Pit when rain intensifies (delay then pit to {pit_option_a})
+
+Compute expected total time for each option and answer in this format:
+A: <time>
+B: <time>
+C: <time>
+D: <time>
+Decision: <A/B/C/D>
+Final: <A/B/C/D>"""
+        else:
+            decision = f"""
+
+What is your strategy?
+A) Pit now for {pit_option_a} tires
+B) Pit now for {pit_option_b} tires
+C) Stay out on current {current_compound} tires
+D) Extend stint and pit later (delay then pit to {pit_option_a})
+
+Compute expected total time for each option and answer in this format:
+A: <time>
+B: <time>
+C: <time>
+D: <time>
+Decision: <A/B/C/D>
+Final: <A/B/C/D>"""
+    else:
+        if has_rain:
+            decision = f"""
 
 What is your strategy?
 A) Pit now for {pit_option_a} (rain-ready)
@@ -155,8 +384,8 @@ C) Stay out on current {current_compound} tires
 D) Pit when rain intensifies
 
 Reply with your choice and reasoning."""
-    else:
-        decision = f"""
+        else:
+            decision = f"""
 
 What is your strategy?
 A) Pit now for {pit_option_a} tires
@@ -169,17 +398,17 @@ Reply with your choice and reasoning."""
     if multi_turn:
         decision += " If you need clarification, answer the pit wall question when asked."
 
-    return f"{context}\n\n{priors}{decision}"
+    return f"{context}\n\n{priors}{strategy_block}{decision}"
 
 
-def _build_prompt_messages(info: Dict[str, Any], use_tools: bool, multi_turn: bool) -> List[Dict[str, str]]:
+def _build_prompt_messages(info: Dict[str, Any], use_tools: bool, multi_turn: bool, deep_reasoning: bool) -> List[Dict[str, str]]:
     return [
         {"role": "system", "content": _system_prompt(use_tools, multi_turn)},
-        {"role": "user", "content": _build_prompt_text(info, use_tools, multi_turn)},
+        {"role": "user", "content": _build_prompt_text(info, use_tools, multi_turn, deep_reasoning)},
     ]
 
 
-def _prepare_dataset(dataset: Dataset, use_tools: bool, multi_turn: bool) -> Dataset:
+def _prepare_dataset(dataset: Dataset, use_tools: bool, multi_turn: bool, deep_reasoning: bool) -> Dataset:
     def _map(row, idx):
         info = _parse_info(row.get("info"))
         info.setdefault("track", row.get("track"))
@@ -189,10 +418,18 @@ def _prepare_dataset(dataset: Dataset, use_tools: bool, multi_turn: bool) -> Dat
         info.setdefault("position_delta_recent", row.get("position_delta_recent"))
         info.setdefault("warmup_risk", row.get("warmup_risk"))
         info.setdefault("conflict_score", row.get("conflict_score"))
+        if deep_reasoning:
+            try:
+                expected_times, _ = _expected_option_times(info)
+                if expected_times:
+                    best = min(expected_times.items(), key=lambda kv: kv[1])[0]
+                    row["answer"] = best
+            except Exception:
+                pass
         row["info"] = json.dumps(info)
         row["track"] = info.get("track") or "Unknown"
         row["season"] = info.get("season")
-        row["prompt"] = _build_prompt_messages(info, use_tools, multi_turn)
+        row["prompt"] = _build_prompt_messages(info, use_tools, multi_turn, deep_reasoning)
         row["example_id"] = int(idx)
         return row
 
@@ -232,7 +469,7 @@ def _load_openf1_scenarios():
     return scenarios
 
 
-def create_f1_dataset(use_tools: bool = False, multi_turn: bool = False) -> Dataset:
+def create_f1_dataset(use_tools: bool = False, multi_turn: bool = False, deep_reasoning: bool = False) -> Dataset:
     """Create F1 racing strategy scenarios from OpenF1 cache."""
     openf1_scenarios = _load_openf1_scenarios()
     if not openf1_scenarios:
@@ -240,7 +477,7 @@ def create_f1_dataset(use_tools: bool = False, multi_turn: bool = False) -> Data
             "OpenF1 scenarios not found. Run scripts/build_openf1_dataset.py to generate data/openf1_scenarios.jsonl."
         )
     dataset = Dataset.from_list(openf1_scenarios)
-    return _prepare_dataset(dataset, use_tools, multi_turn)
+    return _prepare_dataset(dataset, use_tools, multi_turn, deep_reasoning)
 
 
 def _pit_wall_question(info: Dict[str, Any], response: str) -> str:
@@ -491,12 +728,45 @@ async def final_choice_present(completion) -> float:
     return 0.0 if _extract_final_choice(response) else -0.3
 
 
+async def option_times_present(completion) -> float:
+    """Reward for listing option time estimates in deep reasoning mode."""
+    if not completion:
+        return 0.0
+    response = completion[-1]["content"]
+    times = _extract_option_times(response)
+    if len(times) >= 4:
+        return 0.3
+    if len(times) >= 2:
+        return 0.1
+    return 0.0
+
+
+async def option_time_accuracy(completion, info) -> float:
+    """Reward for accurate time estimates vs strategy model ground truth."""
+    if not completion:
+        return 0.0
+    response = completion[-1]["content"]
+    predicted = _extract_option_times(response)
+    if not predicted:
+        return 0.0
+    info_dict = _parse_info(info)
+    expected, _ = _expected_option_times(info_dict)
+    shared = [k for k in predicted.keys() if k in expected]
+    if not shared:
+        return 0.0
+    errors = [abs(predicted[k] - expected[k]) for k in shared]
+    mae = sum(errors) / len(errors)
+    # Scale reward: 0.6 max, linearly down to 0 at 8s MAE
+    return max(0.0, 0.6 * (1.0 - (mae / 8.0)))
+
+
 def load_environment(
     num_examples: int = -1,
     eval_season: Optional[int] = 2024,
     eval_tracks: Optional[List[str]] = None,
     use_tools: bool = False,
     multi_turn: bool = False,
+    deep_reasoning: bool = True,
     multi_env: bool = False,
     env_tracks: Optional[List[str]] = None,
     max_tracks: int = 4,
@@ -504,7 +774,7 @@ def load_environment(
     env_id: str = "herr-professor/f1-strategy",
 ) -> vf.Environment:
     """Load the F1 strategy environment."""
-    dataset = create_f1_dataset(use_tools=use_tools, multi_turn=multi_turn)
+    dataset = create_f1_dataset(use_tools=use_tools, multi_turn=multi_turn, deep_reasoning=deep_reasoning)
     train_dataset, eval_dataset = _split_train_eval(dataset, eval_season, eval_tracks)
     if train_dataset is None or len(train_dataset) == 0:
         train_dataset = dataset
@@ -520,7 +790,23 @@ def load_environment(
         # Create closure to pass use_tools flag to uses_tools function
         async def uses_tools_wrapper(completion, tool_call_count: Optional[int] = None) -> float:
             return await uses_tools(completion, tool_call_count, use_tools=tools_enabled)
-        
+
+        if deep_reasoning:
+            return vf.Rubric(
+                funcs=[
+                    correct_strategy,
+                    final_choice_present,
+                    option_times_present,
+                    option_time_accuracy,
+                    has_reasoning,
+                    mentions_key_factors,
+                    acknowledges_uncertainty,
+                    outcome_aligned,
+                    uses_tools_wrapper,
+                ],
+                weights=[1.0, 1.0, 0.3, 0.6, 0.2, 0.25, 0.1, 0.15, 0.1],
+            )
+
         return vf.Rubric(
             funcs=[
                 correct_strategy,

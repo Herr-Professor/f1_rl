@@ -26,6 +26,11 @@
 ### Single-Turn (default)
 Standard strategy decision with reasoning.
 
+### Deep Reasoning Mode (`deep_reasoning=True`)
+Requires the model to compute expected total time for each option using a provided strategy model
+and report numeric estimates before choosing the final strategy. This mode scores numerical
+accuracy as evidence of deeper reasoning.
+
 ### Multi-Turn (`multi_turn=True`)
 Pit wall asks follow-up questions about:
 - Tire degradation impact
@@ -58,6 +63,7 @@ prime eval run f1-strategy -m gpt-4.1-mini -n 50 -r 4
 | `eval_tracks` | list | None | Tracks for eval split |
 | `use_tools` | bool | False | Enable tool calling |
 | `multi_turn` | bool | False | Enable pit wall follow-ups |
+| `deep_reasoning` | bool | True | Require expected-time calculations and score numeric accuracy |
 | `multi_env` | bool | False | Train across multiple tracks |
 | `max_tracks` | int | 4 | Max circuits for multi-env |
 | `max_tokens` | int | 512 | Max response tokens |
