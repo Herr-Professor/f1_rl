@@ -39,13 +39,22 @@ def test_multi_env_loads():
 
 def test_correct_strategy_rubric():
     """Test correct_strategy reward function."""
-    from f1_strategy import correct_strategy
+    from f1_strategy import correct_strategy, _extract_final_choice
     
     async def _test():
-        completion = [{"role": "assistant", "content": "C) Stay out on current tires."}]
+        completion = [{"role": "assistant", "content": "Reasoning...\nFinal: C"}]
         assert await correct_strategy(completion, "C") == 1.0
         assert await correct_strategy(completion, "A") == 0.0
         assert await correct_strategy([], "C") == 0.0
+
+        # Ensure we don't treat option-time lines as a decision.
+        times_only = [{"role": "assistant", "content": "A: 120.1\nB: 121.2\nC: 118.9\nD: 130.0"}]
+        assert _extract_final_choice(times_only[-1]["content"]) is None
+        assert await correct_strategy(times_only, "C") == 0.0
+
+        # Accept a final-line decision even without the "Final:" tag if it's the last line.
+        last_line_choice = [{"role": "assistant", "content": "Some text\nC) Stay out on current tires."}]
+        assert _extract_final_choice(last_line_choice[-1]["content"]) == "C"
     
     asyncio.run(_test())
 
@@ -96,6 +105,17 @@ def test_deep_reasoning_prompt_includes_model_block():
     }
     prompt = _build_prompt_text(info, use_tools=False, multi_turn=False, deep_reasoning=True)
     assert "Strategy Model" in prompt
+
+
+def test_stress_dataset_loads():
+    """Stress dataset is shipped and loads deterministically."""
+    from f1_strategy import load_environment
+
+    env = load_environment(dataset_variant="stress", eval_season=None, deep_reasoning=False)
+    assert len(env.dataset) > 0
+    # Verify example_id exists and is an int.
+    assert "example_id" in env.dataset.column_names
+    assert isinstance(env.dataset["example_id"][0], int)
 
 
 if __name__ == "__main__":

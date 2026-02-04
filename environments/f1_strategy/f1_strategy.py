@@ -1,4 +1,5 @@
 import json
+import hashlib
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -8,6 +9,7 @@ from datasets import Dataset
 
 
 OPENF1_SCENARIOS_PATH = Path(__file__).resolve().parent / "data" / "openf1_scenarios.jsonl"
+STRESS_SCENARIOS_PATH = Path(__file__).resolve().parent / "data" / "stress_scenarios.jsonl"
 
 TRACK_PRIORS: Dict[str, Dict[str, float]] = {
     "Monaco": {"pit_loss": 22.5, "overtake_difficulty": 0.95, "sc_risk_base": 0.45},
@@ -67,6 +69,16 @@ def _parse_info(info) -> Dict[str, Any]:
     return {}
 
 
+def _sha256_file(path: Path) -> Optional[str]:
+    if not path.exists() or not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _system_prompt(use_tools: bool, multi_turn: bool) -> str:
     tool_line = (
         "You may use tools for tire degradation, pit delta, or weather confidence. "
@@ -102,14 +114,27 @@ def _format_bool(value: Optional[bool]) -> str:
 def _extract_final_choice(text: str) -> Optional[str]:
     if not text:
         return None
-    tail_lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
-    tail = "\n".join(tail_lines[-3:]) if tail_lines else text
-    match = re.search(r"(?:^|\n)\s*(?:final|decision|answer|choice)\s*[:\\-]\\s*([ABCD])\\b", tail, re.I)
-    if match:
-        return match.group(1).upper()
-    match = re.search(r"(?:^|\n)\s*([ABCD])\s*(?:$|[).])", tail)
-    if match:
-        return match.group(1).upper()
+    lines = [line.rstrip() for line in text.strip().splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    # Prefer an explicit "Final:" line, searching from the bottom (handles revisions).
+    final_re = re.compile(r"^\s*(?:final|decision|answer|choice)\s*[:\\-]\s*([ABCD])\b", re.I)
+    for line in reversed(lines[-12:]):
+        m = final_re.match(line)
+        if m:
+            return m.group(1).upper()
+
+    # Fallback: only accept a choice if it is the *last non-empty line* and looks like a decision,
+    # not an option time estimate like "A: 123.4".
+    last = lines[-1].strip()
+    m = re.match(r"^\s*([ABCD])\s*(?:[).]|\b)", last)
+    if m:
+        # Disallow "A:" / "B:" style estimate lines.
+        if re.match(r"^\s*[ABCD]\s*:", last):
+            return None
+        return m.group(1).upper()
+
     return None
 
 
@@ -418,7 +443,7 @@ def _prepare_dataset(dataset: Dataset, use_tools: bool, multi_turn: bool, deep_r
         info.setdefault("position_delta_recent", row.get("position_delta_recent"))
         info.setdefault("warmup_risk", row.get("warmup_risk"))
         info.setdefault("conflict_score", row.get("conflict_score"))
-        if deep_reasoning:
+        if deep_reasoning and not info.get("lock_answer", False):
             try:
                 expected_times, _ = _expected_option_times(info)
                 if expected_times:
@@ -452,12 +477,11 @@ def _split_train_eval(dataset: Dataset, eval_season: Optional[int], eval_tracks:
     return train_dataset, eval_dataset
 
 
-def _load_openf1_scenarios():
-    if not OPENF1_SCENARIOS_PATH.exists():
+def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
         return []
-
-    scenarios = []
-    with OPENF1_SCENARIOS_PATH.open("r", encoding="utf-8") as f:
+    scenarios: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -469,14 +493,48 @@ def _load_openf1_scenarios():
     return scenarios
 
 
-def create_f1_dataset(use_tools: bool = False, multi_turn: bool = False, deep_reasoning: bool = False) -> Dataset:
-    """Create F1 racing strategy scenarios from OpenF1 cache."""
-    openf1_scenarios = _load_openf1_scenarios()
-    if not openf1_scenarios:
+def create_f1_dataset(
+    use_tools: bool = False,
+    multi_turn: bool = False,
+    deep_reasoning: bool = False,
+    dataset_variant: str = "openf1",
+    dataset_path: Optional[str] = None,
+    expected_sha256: Optional[str] = None,
+) -> Dataset:
+    """Create F1 racing strategy scenarios from an on-disk JSONL cache.
+
+    dataset_variant:
+      - "openf1": historical scenarios from OpenF1 cache (default)
+      - "stress": adversarial, hand-authored scenarios (deterministic)
+    """
+    if dataset_variant not in {"openf1", "stress"}:
+        raise ValueError(f"Unknown dataset_variant={dataset_variant!r} (expected 'openf1' or 'stress').")
+
+    path = Path(dataset_path) if dataset_path else (STRESS_SCENARIOS_PATH if dataset_variant == "stress" else OPENF1_SCENARIOS_PATH)
+    scenarios = _load_jsonl(path)
+    if not scenarios:
         raise RuntimeError(
-            "OpenF1 scenarios not found. Run scripts/build_openf1_dataset.py to generate data/openf1_scenarios.jsonl."
+            f"Dataset not found or empty at {path}. "
+            "If you're using OpenF1, run scripts/build_openf1_dataset.py to generate data/openf1_scenarios.jsonl."
         )
-    dataset = Dataset.from_list(openf1_scenarios)
+
+    sha256 = _sha256_file(path)
+    if expected_sha256 and sha256 and expected_sha256 != sha256:
+        raise RuntimeError(
+            f"Dataset SHA256 mismatch for {path}. expected={expected_sha256} got={sha256}"
+        )
+
+    dataset = Dataset.from_list(scenarios)
+    if sha256:
+        def _attach_hash(row):
+            info = _parse_info(row.get("info"))
+            info.setdefault("dataset_sha256", sha256)
+            info.setdefault("dataset_variant", dataset_variant)
+            row["info"] = json.dumps(info)
+            return row
+
+        dataset = dataset.map(_attach_hash)
+
     return _prepare_dataset(dataset, use_tools, multi_turn, deep_reasoning)
 
 
@@ -589,20 +647,33 @@ class F1EnvGroupRubric(vf.Rubric):
     def _empty_metrics(self) -> Dict[str, float]:
         return {name: 0.0 for name in self.all_reward_names}
 
-    async def score_rollout(self, state: vf.State, score_sem) -> None:
+    async def score_rollout(self, state: vf.State, score_sem=None, **kwargs) -> None:
         env = self._resolve_env(state)
         if env is None:
             state["reward"] = 0.0
             state["metrics"] = self._empty_metrics()
             return
-        await env.rubric.score_rollout(state, score_sem=score_sem)
+        if score_sem is None:
+            from contextlib import asynccontextmanager
+
+            @asynccontextmanager
+            async def _noop():
+                yield
+
+            score_sem = _noop()
+        # Compatibility shim: different verifiers builds have different rubric signatures.
+        # Try (state, score_sem) first, then fall back to (state).
+        try:
+            await env.rubric.score_rollout(state, score_sem)
+        except TypeError:
+            await env.rubric.score_rollout(state)
         metrics = self._empty_metrics()
         for name, value in (state.get("metrics") or {}).items():
             if name in metrics:
                 metrics[name] = value
         state["metrics"] = metrics
 
-    async def score_group(self, states: List[vf.State], score_sem) -> None:
+    async def score_group(self, states: List[vf.State], score_sem=None, **kwargs) -> None:
         if not states:
             return
         env = self._resolve_env(states[0])
@@ -612,7 +683,20 @@ class F1EnvGroupRubric(vf.Rubric):
                 state["metrics"] = self._empty_metrics()
                 state["timing"]["scoring_ms"] = 0.0
             return
-        await env.rubric.score_group(states, score_sem=score_sem)
+        if score_sem is None:
+            from contextlib import asynccontextmanager
+
+            @asynccontextmanager
+            async def _noop():
+                yield
+
+            score_sem = _noop()
+        # Compatibility shim: different verifiers builds have different rubric signatures.
+        # Try (states, score_sem) first, then fall back to (states).
+        try:
+            await env.rubric.score_group(states, score_sem)
+        except TypeError:
+            await env.rubric.score_group(states)
         for state in states:
             metrics = self._empty_metrics()
             for name, value in (state.get("metrics") or {}).items():
@@ -622,12 +706,14 @@ class F1EnvGroupRubric(vf.Rubric):
 
 
 class F1EnvGroup(vf.EnvGroup):
-    """EnvGroup that routes by track while keeping task stable for Prime-RL."""
+    """EnvGroup that routes by track and keeps task consistent with env_map keys."""
 
     def __init__(self, env_id: str, **kwargs):
         super().__init__(env_id=env_id, **kwargs)
         self.env_id = env_id
         self.rubric = F1EnvGroupRubric(self.env_map, self.env_names)
+        # Prime-RL expects task to remain stable as the environment id. Verifiers'
+        # EnvGroup concatenation overwrites `task` to env_names; we override it back.
         if self.dataset is not None:
             self.dataset = self.dataset.map(lambda row: {**row, "task": env_id})
         if self.eval_dataset is not None:
@@ -640,6 +726,7 @@ class F1EnvGroup(vf.EnvGroup):
         if env is None:
             env = self.envs[0]
         routed = dict(input)
+        # Keep task stable for Prime-RL; scoring uses track extracted from info.
         routed["task"] = self.env_id
         return await env.rollout(routed, client, model, sampling_args)
 
@@ -764,6 +851,10 @@ def load_environment(
     num_examples: int = -1,
     eval_season: Optional[int] = 2024,
     eval_tracks: Optional[List[str]] = None,
+    dataset_variant: str = "openf1",
+    dataset_path: Optional[str] = None,
+    expected_dataset_sha256: Optional[str] = None,
+    seed: Optional[int] = None,
     use_tools: bool = False,
     multi_turn: bool = False,
     deep_reasoning: bool = True,
@@ -774,7 +865,14 @@ def load_environment(
     env_id: str = "herr-professor/f1-strategy",
 ) -> vf.Environment:
     """Load the F1 strategy environment."""
-    dataset = create_f1_dataset(use_tools=use_tools, multi_turn=multi_turn, deep_reasoning=deep_reasoning)
+    dataset = create_f1_dataset(
+        use_tools=use_tools,
+        multi_turn=multi_turn,
+        deep_reasoning=deep_reasoning,
+        dataset_variant=dataset_variant,
+        dataset_path=dataset_path,
+        expected_sha256=expected_dataset_sha256,
+    )
     train_dataset, eval_dataset = _split_train_eval(dataset, eval_season, eval_tracks)
     if train_dataset is None or len(train_dataset) == 0:
         train_dataset = dataset
@@ -782,14 +880,35 @@ def load_environment(
         eval_dataset = None
 
     if num_examples > 0:
-        train_dataset = train_dataset.select(range(min(num_examples, len(train_dataset))))
+        n_train = min(num_examples, len(train_dataset))
+        if seed is not None:
+            import random
+
+            rng = random.Random(int(seed))
+            idxs = list(range(len(train_dataset)))
+            rng.shuffle(idxs)
+            train_dataset = train_dataset.select(idxs[:n_train])
+        else:
+            train_dataset = train_dataset.select(range(n_train))
+
         if eval_dataset is not None:
-            eval_dataset = eval_dataset.select(range(min(num_examples, len(eval_dataset))))
+            n_eval = min(num_examples, len(eval_dataset))
+            if seed is not None:
+                import random
+
+                rng = random.Random(int(seed) + 1)
+                idxs = list(range(len(eval_dataset)))
+                rng.shuffle(idxs)
+                eval_dataset = eval_dataset.select(idxs[:n_eval])
+            else:
+                eval_dataset = eval_dataset.select(range(n_eval))
 
     def build_rubric(tools_enabled: bool = False) -> vf.Rubric:
         # Create closure to pass use_tools flag to uses_tools function
         async def uses_tools_wrapper(completion, tool_call_count: Optional[int] = None) -> float:
             return await uses_tools(completion, tool_call_count, use_tools=tools_enabled)
+        # Keep metric name stable/readable in dashboards.
+        uses_tools_wrapper.__name__ = "uses_tools"  # type: ignore[attr-defined]
 
         if deep_reasoning:
             return vf.Rubric(
